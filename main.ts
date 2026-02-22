@@ -795,11 +795,70 @@ async function generateRecordingPage(sessionId: string): Promise<string> {
       }
     }
 
+    // Convert WebM to WAV
+    async function convertToWav(blob) {
+      const arrayBuffer = await blob.arrayBuffer();
+      const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+      
+      const numChannels = 1;
+      const sampleRate = audioBuffer.sampleRate;
+      const format = 1; // PCM
+      const bitDepth = 16;
+      
+      const data = audioBuffer.getChannelData(0);
+      const dataLength = data.length * (bitDepth / 8);
+      const headerLength = 44;
+      const totalLength = headerLength + dataLength;
+      
+      const arrayBuffer2 = new ArrayBuffer(totalLength);
+      const view = new DataView(arrayBuffer2);
+      
+      // WAV header
+      writeString(view, 0, 'RIFF');
+      view.setUint32(4, totalLength - 8, true);
+      writeString(view, 8, 'WAVE');
+      writeString(view, 12, 'fmt ');
+      view.setUint32(16, 16, true);
+      view.setUint16(20, format, true);
+      view.setUint16(22, numChannels, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * numChannels * (bitDepth / 8), true);
+      view.setUint16(32, numChannels * (bitDepth / 8), true);
+      view.setUint16(34, bitDepth, true);
+      writeString(view, 36, 'data');
+      view.setUint32(40, dataLength, true);
+      
+      // Write audio data
+      floatTo16BitPCM(view, 44, data);
+      
+      return new Blob([arrayBuffer2], { type: 'audio/wav' });
+    }
+    
+    function writeString(view, offset, string) {
+      for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+      }
+    }
+    
+    function floatTo16BitPCM(view, offset, input) {
+      for (let i = 0; i < input.length; i++, offset += 2) {
+        const s = Math.max(-1, Math.min(1, input[i]));
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      }
+    }
+
     async function uploadAudio(blob) {
       try {
+        statusEl.innerHTML = '<span class="loading"></span>转换格式中...';
+        
+        // Convert WebM to WAV
+        const wavBlob = await convertToWav(blob);
+        
+        statusEl.innerHTML = '<span class="loading"></span>正在转写...';
+        
         const response = await fetch(\`/api/upload/\${sessionId}\`, {
           method: "POST",
-          body: blob
+          body: wavBlob
         });
 
         const data = await response.json();
