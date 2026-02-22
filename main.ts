@@ -5,12 +5,14 @@
  * Deployed on Deno Deploy with MCP HTTP Streamable transport
  */
 
+// Open Deno KV for persistent storage
+const kv = await Deno.openKv();
+
 // Types
 interface Session {
   id: string;
   createdAt: number;
   status: "waiting" | "recording" | "processing" | "completed" | "error";
-  audioData?: Uint8Array;
   result?: string;
   error?: string;
 }
@@ -29,22 +31,23 @@ interface MCPResponse {
   error?: { code: number; message: string; data?: unknown };
 }
 
-// Session storage (in-memory for Deno Deploy)
-const sessions = new Map<string, Session>();
-
 // Generate unique session ID
 function generateSessionId(): string {
   return crypto.randomUUID();
 }
 
-// Clean up old sessions (older than 5 minutes)
-function cleanupOldSessions(): void {
-  const now = Date.now();
-  for (const [id, session] of sessions) {
-    if (now - session.createdAt > 5 * 60 * 1000) {
-      sessions.delete(id);
-    }
-  }
+// KV-based session storage
+async function saveSession(session: Session): Promise<void> {
+  await kv.set(["sessions", session.id], session, { expireIn: 5 * 60 * 1000 });
+}
+
+async function getSession(id: string): Promise<Session | null> {
+  const result = await kv.get<Session>(["sessions", id]);
+  return result.value;
+}
+
+async function deleteSession(id: string): Promise<void> {
+  await kv.delete(["sessions", id]);
 }
 
 // Call SiliconFlow API for transcription
@@ -54,7 +57,6 @@ async function transcribeAudio(audioData: Uint8Array): Promise<string> {
     throw new Error("SILICONFLOW_API_KEY not configured");
   }
 
-  // Create form data
   const formData = new FormData();
   const blob = new Blob([audioData], { type: "audio/wav" });
   formData.append("file", blob, "recording.wav");
@@ -122,31 +124,25 @@ async function handleMCPRequest(request: MCPRequest): Promise<MCPResponse> {
       const toolName = (params as Record<string, unknown>)?.name as string;
       
       if (toolName === "voice-to-text") {
-        // Clean up old sessions
-        cleanupOldSessions();
-
-        // Create new session
         const sessionId = generateSessionId();
         const session: Session = {
           id: sessionId,
           createdAt: Date.now(),
           status: "waiting",
         };
-        sessions.set(sessionId, session);
+        await saveSession(session);
 
-        // Get the base URL from request or use default
         const baseUrl = Deno.env.get("DENO_DEPLOYMENT_ID") 
           ? `https://${Deno.env.get("DENO_DEPLOYMENT_ID")}.deno.dev`
           : "http://localhost:8000";
 
         const recordUrl = `${baseUrl}/record/${sessionId}`;
 
-        // Wait for result with timeout (60 seconds)
         const maxWait = 60000;
         const startTime = Date.now();
 
         while (true) {
-          const currentSession = sessions.get(sessionId);
+          const currentSession = await getSession(sessionId);
           
           if (!currentSession) {
             return {
@@ -164,7 +160,7 @@ async function handleMCPRequest(request: MCPRequest): Promise<MCPResponse> {
           }
 
           if (currentSession.status === "completed" && currentSession.result) {
-            sessions.delete(sessionId);
+            await deleteSession(sessionId);
             return {
               jsonrpc: "2.0",
               id,
@@ -181,7 +177,7 @@ async function handleMCPRequest(request: MCPRequest): Promise<MCPResponse> {
 
           if (currentSession.status === "error") {
             const error = currentSession.error || "未知错误";
-            sessions.delete(sessionId);
+            await deleteSession(sessionId);
             return {
               jsonrpc: "2.0",
               id,
@@ -197,7 +193,7 @@ async function handleMCPRequest(request: MCPRequest): Promise<MCPResponse> {
           }
 
           if (Date.now() - startTime > maxWait) {
-            sessions.delete(sessionId);
+            await deleteSession(sessionId);
             return {
               jsonrpc: "2.0",
               id,
@@ -212,7 +208,6 @@ async function handleMCPRequest(request: MCPRequest): Promise<MCPResponse> {
             };
           }
 
-          // Wait 500ms before checking again
           await new Promise((resolve) => setTimeout(resolve, 500));
         }
       }
@@ -239,72 +234,48 @@ async function handleMCPRequest(request: MCPRequest): Promise<MCPResponse> {
   }
 }
 
-// Serve static file
-async function serveStatic(path: string): Promise<Response> {
-  try {
-    const filePath = new URL(path, import.meta.url);
-    const file = await Deno.readFile(filePath);
-    const contentType = path.endsWith(".html") ? "text/html" : "application/octet-stream";
-    return new Response(file, {
-      headers: { "Content-Type": contentType },
-    });
-  } catch {
-    return new Response("Not Found", { status: 404 });
-  }
-}
+// CORS headers
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
 
 // Main handler
 async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const pathname = url.pathname;
 
-  // CORS headers
-  const corsHeaders = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-  };
-
-  // Handle preflight
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
   }
 
-  // MCP endpoint
   if (pathname === "/mcp" && req.method === "POST") {
     try {
       const body = await req.json();
       const response = await handleMCPRequest(body);
       return new Response(JSON.stringify(response), {
-        headers: {
-          "Content-Type": "application/json",
-          ...corsHeaders,
-        },
+        headers: { "Content-Type": "application/json", ...corsHeaders },
       });
-    } catch (error) {
+    } catch {
       return new Response(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          error: { code: -32700, message: "Parse error" },
-        }),
+        JSON.stringify({ jsonrpc: "2.0", error: { code: -32700, message: "Parse error" } }),
         { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } }
       );
     }
   }
 
-  // Recording page
   if (pathname.startsWith("/record/")) {
     const sessionId = pathname.replace("/record/", "");
-    const html = await generateRecordingPage(sessionId);
+    const html = generateRecordingPage(sessionId);
     return new Response(html, {
       headers: { "Content-Type": "text/html; charset=utf-8", ...corsHeaders },
     });
   }
 
-  // Upload audio API
   if (pathname.startsWith("/api/upload/") && req.method === "POST") {
     const sessionId = pathname.replace("/api/upload/", "");
-    const session = sessions.get(sessionId);
+    const session = await getSession(sessionId);
 
     if (!session) {
       return new Response(
@@ -315,13 +286,14 @@ async function handler(req: Request): Promise<Response> {
 
     try {
       session.status = "processing";
+      await saveSession(session);
+      
       const audioData = new Uint8Array(await req.arrayBuffer());
-      session.audioData = audioData;
-
-      // Transcribe
       const result = await transcribeAudio(audioData);
+      
       session.result = result;
       session.status = "completed";
+      await saveSession(session);
 
       return new Response(
         JSON.stringify({ success: true, result }),
@@ -330,6 +302,7 @@ async function handler(req: Request): Promise<Response> {
     } catch (error) {
       session.status = "error";
       session.error = error instanceof Error ? error.message : "Unknown error";
+      await saveSession(session);
       return new Response(
         JSON.stringify({ error: session.error }),
         { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
@@ -337,10 +310,9 @@ async function handler(req: Request): Promise<Response> {
     }
   }
 
-  // Session status API
   if (pathname.startsWith("/api/status/")) {
     const sessionId = pathname.replace("/api/status/", "");
-    const session = sessions.get(sessionId);
+    const session = await getSession(sessionId);
 
     if (!session) {
       return new Response(
@@ -350,16 +322,11 @@ async function handler(req: Request): Promise<Response> {
     }
 
     return new Response(
-      JSON.stringify({
-        status: session.status,
-        result: session.result,
-        error: session.error,
-      }),
+      JSON.stringify({ status: session.status, result: session.result, error: session.error }),
       { headers: { "Content-Type": "application/json", ...corsHeaders } }
     );
   }
 
-  // Root redirect to recording demo
   if (pathname === "/") {
     return new Response(null, {
       status: 302,
@@ -367,12 +334,10 @@ async function handler(req: Request): Promise<Response> {
     });
   }
 
-  // 404
   return new Response("Not Found", { status: 404, headers: corsHeaders });
 }
 
-// Generate recording page HTML
-async function generateRecordingPage(sessionId: string): Promise<string> {
+function generateRecordingPage(sessionId: string): string {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -394,7 +359,6 @@ async function generateRecordingPage(sessionId: string): Promise<string> {
       -webkit-font-smoothing: antialiased;
     }
     
-    /* 背景光晕效果 */
     body::before {
       content: '';
       position: fixed;
@@ -416,7 +380,6 @@ async function generateRecordingPage(sessionId: string): Promise<string> {
       66% { transform: translate(-1%, 1%) rotate(-1deg); }
     }
     
-    /* 主容器 - 玻璃质感 */
     .container {
       position: relative;
       text-align: center;
@@ -433,7 +396,6 @@ async function generateRecordingPage(sessionId: string): Promise<string> {
         inset 0 1px 0 rgba(255, 255, 255, 0.1);
     }
     
-    /* 内部光泽 */
     .container::before {
       content: '';
       position: absolute;
@@ -465,7 +427,6 @@ async function generateRecordingPage(sessionId: string): Promise<string> {
       z-index: 1;
     }
     
-    /* 麦克风按钮容器 */
     .mic-container {
       position: relative;
       width: 140px;
@@ -474,7 +435,6 @@ async function generateRecordingPage(sessionId: string): Promise<string> {
       z-index: 1;
     }
     
-    /* 外圈光环 */
     .mic-ring {
       position: absolute;
       top: -10px;
@@ -496,7 +456,6 @@ async function generateRecordingPage(sessionId: string): Promise<string> {
       opacity: 1;
     }
     
-    /* 麦克风按钮 */
     .mic-icon {
       width: 140px;
       height: 140px;
@@ -515,7 +474,6 @@ async function generateRecordingPage(sessionId: string): Promise<string> {
       overflow: hidden;
     }
     
-    /* 按钮内部光泽 */
     .mic-icon::before {
       content: '';
       position: absolute;
@@ -567,7 +525,6 @@ async function generateRecordingPage(sessionId: string): Promise<string> {
       z-index: 1;
     }
     
-    /* 波形可视化 */
     .visualizer {
       display: flex;
       align-items: center;
@@ -587,7 +544,6 @@ async function generateRecordingPage(sessionId: string): Promise<string> {
       box-shadow: 0 0 10px rgba(168, 85, 247, 0.5);
     }
     
-    /* 状态文字 */
     .status {
       font-size: 17px;
       color: rgba(255, 255, 255, 0.7);
@@ -611,7 +567,6 @@ async function generateRecordingPage(sessionId: string): Promise<string> {
       color: #f43f5e;
     }
     
-    /* 结果框 - 玻璃质感 */
     .result-box {
       background: rgba(255, 255, 255, 0.05);
       backdrop-filter: blur(20px);
@@ -643,7 +598,6 @@ async function generateRecordingPage(sessionId: string): Promise<string> {
       font-weight: 400;
     }
     
-    /* 提示文字 */
     .hint {
       font-size: 13px;
       color: rgba(255, 255, 255, 0.35);
@@ -656,7 +610,6 @@ async function generateRecordingPage(sessionId: string): Promise<string> {
       display: none !important;
     }
     
-    /* 加载动画 */
     .loading {
       display: inline-block;
       width: 20px;
@@ -715,7 +668,6 @@ async function generateRecordingPage(sessionId: string): Promise<string> {
     const hintEl = document.getElementById("hint");
     const visualizerEl = document.getElementById("visualizer");
 
-    // Create visualizer bars
     for (let i = 0; i < 24; i++) {
       const bar = document.createElement("div");
       bar.className = "bar";
@@ -795,14 +747,13 @@ async function generateRecordingPage(sessionId: string): Promise<string> {
       }
     }
 
-    // Convert WebM to WAV
     async function convertToWav(blob) {
       const arrayBuffer = await blob.arrayBuffer();
       const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
       
       const numChannels = 1;
       const sampleRate = audioBuffer.sampleRate;
-      const format = 1; // PCM
+      const format = 1;
       const bitDepth = 16;
       
       const data = audioBuffer.getChannelData(0);
@@ -813,7 +764,6 @@ async function generateRecordingPage(sessionId: string): Promise<string> {
       const arrayBuffer2 = new ArrayBuffer(totalLength);
       const view = new DataView(arrayBuffer2);
       
-      // WAV header
       writeString(view, 0, 'RIFF');
       view.setUint32(4, totalLength - 8, true);
       writeString(view, 8, 'WAVE');
@@ -828,7 +778,6 @@ async function generateRecordingPage(sessionId: string): Promise<string> {
       writeString(view, 36, 'data');
       view.setUint32(40, dataLength, true);
       
-      // Write audio data
       floatTo16BitPCM(view, 44, data);
       
       return new Blob([arrayBuffer2], { type: 'audio/wav' });
@@ -851,7 +800,6 @@ async function generateRecordingPage(sessionId: string): Promise<string> {
       try {
         statusEl.innerHTML = '<span class="loading"></span>转换格式中...';
         
-        // Convert WebM to WAV
         const wavBlob = await convertToWav(blob);
         
         statusEl.innerHTML = '<span class="loading"></span>正在转写...';
@@ -911,7 +859,6 @@ async function generateRecordingPage(sessionId: string): Promise<string> {
 </html>`;
 }
 
-// Start server
 const port = parseInt(Deno.env.get("PORT") || "8000");
 console.log(`🎤 OpenCode Voice MCP Server running on port ${port}`);
 Deno.serve({ port }, handler);
